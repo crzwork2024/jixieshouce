@@ -61,7 +61,11 @@ ANSWER_PROMPT_TEMPLATE = """用户问题：{query}
 
 
 def _build_context(blocks: list[dict]) -> str:
-    """将检索到的语义块格式化为 LLM 上下文。"""
+    """
+    将检索到的语义块（含父块）格式化为 LLM 上下文。
+    父块 raw_content 包含完整 HTML 表格和图片标记，不额外截断，
+    让 LLM 能看到完整表格数据。
+    """
     parts = []
     for i, block in enumerate(blocks, 1):
         page_range  = block.get("page_range", [])
@@ -76,14 +80,25 @@ def _build_context(blocks: list[dict]) -> str:
             else f"第{page_range[0]+1}-{page_range[-1]+1}页"
         )
 
-        type_label = {"table": "[表格]", "image": "[图片]", "title": "[标题]"}.get(
-            block_type, "[文本]"
-        )
+        # 父块类型映射
+        type_label_map = {
+            "table":      "[表格]",
+            "table_unit": "[表格单元]",
+            "image":      "[图片]",
+            "title":      "[标题]",
+            "section":    "[章节]",
+            "list":       "[列表]",
+        }
+        type_label = type_label_map.get(block_type, "[文本]")
+
+        # 父块 (table_unit / section) 包含完整表格 HTML，不截断（最多 6000 字符）
+        # 普通文本块保留原有限制
+        max_chars = 6000 if block_type in ("table_unit", "table") else 2000
+        content_str = raw_content[:max_chars] + ("..." if len(raw_content) > max_chars else "")
 
         parts.append(
             f"[{i}] {type_label} 章节：{chapter} | {page_str} | block_id={block_id}\n"
-            f"{raw_content[:1500]}"
-            + ("..." if len(raw_content) > 1500 else "")
+            f"{content_str}"
         )
     return "\n\n---\n\n".join(parts)
 
@@ -302,7 +317,7 @@ class RAGEngine:
     # ────────────────────────────────────────
 
     def _build_references(self, blocks: list[dict]) -> list[dict]:
-        """为每个引用块生成标准参考文献条目。"""
+        """为每个引用块生成标准参考文献条目（含完整 raw_content 供前端渲染）。"""
         refs = []
         for i, block in enumerate(blocks, 1):
             page_range  = block.get("page_range", [0])
@@ -311,12 +326,15 @@ class RAGEngine:
             raw_content = block.get("raw_content", block.get("document", ""))
             block_id    = block.get("id", block.get("block_id", ""))
 
-            # 预览文本（最多 3 行 / 200 字）
-            preview = raw_content[:200].strip()
-            if block_type == "table":
+            # 预览文本（供 tooltip / 折叠显示）
+            is_table = block_type in ("table", "table_unit")
+            is_image = block_type == "image"
+            if is_table:
                 preview = _table_preview(raw_content)
-            elif block_type == "image":
+            elif is_image:
                 preview = "[图片内容]"
+            else:
+                preview = raw_content[:300].strip()
 
             page_label = (
                 f"第{page_range[0]+1}页"
@@ -324,44 +342,44 @@ class RAGEngine:
                 else f"第{page_range[0]+1}-{page_range[-1]+1}页"
             )
 
+            # 判断 raw_content 中是否含 HTML 表格
+            has_html_table = "<table" in raw_content.lower() if raw_content else False
+            # 提取图片路径列表（格式：![...](images/xxx.png)）
+            img_paths = re.findall(r"!\[.*?\]\((images/[^)]+)\)", raw_content)
+
             refs.append({
-                "index":       i,
-                "block_id":    block_id,
-                "chapter":     chapter,
-                "page_label":  page_label,
-                "block_type":  block_type,
-                "preview":     preview,
-                "pdf_ref_url": _build_pdf_ref_url(block),
-                "page_range":  page_range,
-                "bboxes":      block.get("bboxes", []),
-                "pdf_file_id": block.get("pdf_file_id", ""),
+                "index":         i,
+                "block_id":      block_id,
+                "chapter":       chapter,
+                "page_label":    page_label,
+                "block_type":    block_type,
+                "preview":       preview,
+                "raw_content":   raw_content,   # 完整内容，前端用于渲染 HTML 表格和图片
+                "has_html_table": has_html_table,
+                "img_paths":     img_paths,
+                "pdf_ref_url":   _build_pdf_ref_url(block),
+                "page_range":    page_range,
+                "bboxes":        block.get("bboxes", []),
+                "pdf_file_id":   block.get("pdf_file_id", ""),
             })
         return refs
 
     def _post_process_answer(self, raw: str, blocks: list[dict]) -> str:
         """
-        将 LLM 输出中的 {{TABLE:id}} / {{IMAGE:id}} 占位符替换为
-        前端可识别的 Markdown 格式引用标记。
+        将 LLM 输出中的 {{TABLE:id}} / {{IMAGE:id}} 占位符转换为
+        前端可识别的特殊 HTML 注释标记（<!-- EMBED_TABLE:id --> / <!-- EMBED_IMAGE:id -->）。
+        前端 ChatPanel 会将这些标记替换为实际渲染内容。
         """
-        id_map = {
-            b.get("id", b.get("block_id", "")): b
-            for b in blocks
-        }
-
-        def replace_table(m: re.Match) -> str:
-            bid = m.group(1)
-            b   = id_map.get(bid, {})
-            cap = b.get("chapter_path", "")
-            return f"\n\n> **[表格引用]** `block_id={bid}` 章节：{cap}\n\n"
-
-        def replace_image(m: re.Match) -> str:
-            bid = m.group(1)
-            b   = id_map.get(bid, {})
-            cap = b.get("chapter_path", "")
-            return f"\n\n> **[图片引用]** `block_id={bid}` 章节：{cap}\n\n"
-
-        out = re.sub(r"\{\{TABLE:([^}]+)\}\}", replace_table, raw)
-        out = re.sub(r"\{\{IMAGE:([^}]+)\}\}", replace_image, out)
+        out = re.sub(
+            r"\{\{TABLE:([^}]+)\}\}",
+            lambda m: f"\n\n<!-- EMBED_TABLE:{m.group(1)} -->\n\n",
+            raw,
+        )
+        out = re.sub(
+            r"\{\{IMAGE:([^}]+)\}\}",
+            lambda m: f"\n\n<!-- EMBED_IMAGE:{m.group(1)} -->\n\n",
+            out,
+        )
         return out.strip()
 
 

@@ -70,7 +70,29 @@
                       :type="typeTagMap[ref.block_type] || 'info'"
                     >{{ typeLabel(ref.block_type) }}</el-tag>
                   </div>
-                  <div class="ref-preview" v-html="sanitize(ref.preview)" />
+                  <!-- 表格类型：渲染完整 HTML 表格 -->
+                  <div
+                    v-if="ref.has_html_table"
+                    class="ref-preview ref-table-wrap"
+                    v-html="sanitizeTable(ref.raw_content)"
+                  />
+                  <!-- 图片类型：渲染图片 -->
+                  <div
+                    v-else-if="isImageType(ref.block_type)"
+                    class="ref-preview ref-image-wrap"
+                  >
+                    <img
+                      v-for="(path, idx) in ref.img_paths"
+                      :key="idx"
+                      :src="`/images/${path.replace('images/', '')}`"
+                      class="ref-img"
+                      :alt="`图片 ${idx + 1}`"
+                      onerror="this.style.display='none'"
+                    />
+                    <span v-if="!ref.img_paths || !ref.img_paths.length" class="ref-preview-text">[图片]</span>
+                  </div>
+                  <!-- 普通文本 -->
+                  <div v-else class="ref-preview" v-html="sanitize(ref.preview)" />
                 </div>
               </div>
             </div>
@@ -151,58 +173,102 @@ const exampleQueries = [
 ]
 
 const typeTagMap = {
-  table: 'warning',
-  image: 'success',
-  title: 'primary',
-  text:  'info',
+  table:      'warning',
+  table_unit: 'warning',
+  image:      'success',
+  title:      'primary',
+  section:    'primary',
+  text:       'info',
+  list:       'info',
 }
 
 // ── 工具 ──────────────────────────────────
+
+/** 普通文本安全净化（不允许表格标签） */
 function sanitize(html) {
-  return DOMPurify.sanitize(html || '', { ALLOWED_TAGS: ['b', 'strong', 'em', 'code', 'br', 'img'] })
+  return DOMPurify.sanitize(html || '', {
+    ALLOWED_TAGS: ['b', 'strong', 'em', 'code', 'br', 'span'],
+    ALLOWED_ATTR: [],
+  })
+}
+
+/** 表格 HTML 净化（允许 table 相关标签，禁止脚本/外链） */
+function sanitizeTable(html) {
+  return DOMPurify.sanitize(html || '', {
+    ALLOWED_TAGS: [
+      'table', 'thead', 'tbody', 'tfoot', 'tr', 'th', 'td',
+      'colgroup', 'col', 'caption',
+      'b', 'strong', 'em', 'br', 'span', 'p', 'sup', 'sub',
+    ],
+    ALLOWED_ATTR: ['colspan', 'rowspan', 'align', 'valign', 'style', 'class'],
+    FORBID_ATTR: ['onclick', 'onerror', 'onload'],
+  })
+}
+
+function isImageType(t) {
+  return t === 'image'
 }
 
 function typeLabel(t) {
-  return { table:'表格', image:'图片', title:'标题', text:'文本', list:'列表' }[t] || t
+  const map = {
+    table:      '表格',
+    table_unit: '表格单元',
+    image:      '图片',
+    title:      '标题',
+    section:    '章节',
+    text:       '文本',
+    list:       '列表',
+  }
+  return map[t] || t
 }
 
-// 将回答文本中的引用编号 [1][2] 转换为可点击角标
+/**
+ * 将回答文本渲染为 HTML：
+ * 1. Markdown 解析
+ * 2. [N] → 可点击角标
+ * 3. <!-- EMBED_TABLE:id --> → 实际表格 HTML
+ * 4. <!-- EMBED_IMAGE:id --> → 实际图片
+ */
 function renderAnswer(content, references) {
   if (!content) return ''
   let html = marked.parse(content)
 
-  // 把 [N] 转为可点击角标
+  // [N] → 可点击引用角标
   html = html.replace(/\[(\d+)\]/g, (_, n) => {
     const ref = (references || []).find(r => r.index === Number(n))
     const cls = (activeRefIndex.value === Number(n)) ? 'cite-badge active' : 'cite-badge'
     return `<span class="${cls}" data-ref="${n}" title="${ref ? ref.chapter : ''}">[${n}]</span>`
   })
 
-  // 表格/图片 block 引用替换为内联展示
-  if (references) {
-    references.forEach(ref => {
-      if (ref.block_type === 'table') {
-        const placeholder = `> \\*\\*\\[表格引用\\]\\*\\* \`block_id=${ref.block_id}\`[^\\n]*`
-        const tableHtml = `<div class="inline-table-ref" data-ref="${ref.index}">
-          <div class="inline-ref-label">📊 表格引用 [${ref.index}] · ${ref.page_label}</div>
-          <div class="inline-ref-content">${sanitize(ref.preview)}</div>
-        </div>`
-        html = html.replace(new RegExp(placeholder, 'g'), tableHtml)
-      } else if (ref.block_type === 'image') {
-        const placeholder = `> \\*\\*\\[图片引用\\]\\*\\* \`block_id=${ref.block_id}\`[^\\n]*`
-        const imgHtml = `<div class="inline-image-ref" data-ref="${ref.index}">
-          <div class="inline-ref-label">🖼 图片引用 [${ref.index}] · ${ref.page_label}</div>
-          <img src="/images/${ref.block_id}" class="inline-ref-img"
-               onerror="this.style.display='none'" />
-        </div>`
-        html = html.replace(new RegExp(placeholder, 'g'), imgHtml)
-      }
-    })
-  }
+  // <!-- EMBED_TABLE:id --> → 实际表格
+  html = html.replace(/<!--\s*EMBED_TABLE:([^\s>]+)\s*-->/g, (_, bid) => {
+    const ref = (references || []).find(r => r.block_id === bid)
+    if (!ref) return `<em>[表格 ${bid} 未找到]</em>`
+    const tableHtml = sanitizeTable(ref.raw_content)
+    return `<div class="inline-table-ref" data-ref="${ref.index}">
+      <div class="inline-ref-label">&#128202; 表格引用 [${ref.index}] · ${ref.chapter} · ${ref.page_label}</div>
+      <div class="inline-ref-content">${tableHtml}</div>
+    </div>`
+  })
+
+  // <!-- EMBED_IMAGE:id --> → 实际图片
+  html = html.replace(/<!--\s*EMBED_IMAGE:([^\s>]+)\s*-->/g, (_, bid) => {
+    const ref = (references || []).find(r => r.block_id === bid)
+    if (!ref) return `<em>[图片 ${bid} 未找到]</em>`
+    const imgs = (ref.img_paths || [])
+      .map(p => `<img src="/images/${p.replace('images/', '')}" class="inline-ref-img" alt="图片" onerror="this.style.display='none'"/>`)
+      .join('')
+    return `<div class="inline-image-ref" data-ref="${ref.index}">
+      <div class="inline-ref-label">&#128444; 图片引用 [${ref.index}] · ${ref.chapter} · ${ref.page_label}</div>
+      ${imgs || '<span>[图片加载失败]</span>'}
+    </div>`
+  })
 
   return DOMPurify.sanitize(html, {
-    ADD_TAGS: ['span', 'div', 'img'],
-    ADD_ATTR: ['class', 'data-ref', 'title', 'src', 'onerror'],
+    ADD_TAGS: ['table', 'thead', 'tbody', 'tfoot', 'tr', 'th', 'td', 'colgroup', 'col', 'caption',
+               'span', 'div', 'img', 'p', 'sup', 'sub'],
+    ADD_ATTR: ['class', 'data-ref', 'title', 'src', 'onerror', 'alt',
+               'colspan', 'rowspan', 'align', 'valign', 'style'],
     FORCE_BODY: true,
   })
 }
@@ -396,6 +462,24 @@ defineExpose({ sendQuery: (q) => { inputText.value = q; sendQuery() } })
   display: flex; align-items: center; gap: 6px;
   font-size: 13px; font-weight: 600; color: #6b7280; margin-bottom: 8px;
 }
+.ref-card {
+  border: 1px solid #e4e7ed; border-radius: 8px; padding: 10px 12px;
+  margin-bottom: 8px; cursor: pointer; transition: border-color 0.2s, box-shadow 0.2s;
+  background: #fff;
+}
+.ref-card:hover { border-color: #4361ee; box-shadow: 0 2px 8px rgba(67,97,238,0.1); }
+.ref-card.active { border-color: #4361ee; background: #f0f3ff; }
+.ref-header {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 6px; flex-wrap: wrap;
+}
+.ref-index {
+  background: #4361ee; color: #fff; border-radius: 50%;
+  width: 20px; height: 20px; display: flex; align-items: center;
+  justify-content: center; font-size: 11px; flex-shrink: 0;
+}
+.ref-chapter { font-size: 12px; color: #374151; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ref-page { font-size: 11px; color: #9ca3af; white-space: nowrap; }
+.ref-preview { font-size: 12px; color: #6b7280; margin-top: 4px; }
 
 /* 输入区 */
 .input-area {
@@ -412,14 +496,49 @@ defineExpose({ sendQuery: (q) => { inputText.value = q; sendQuery() } })
   margin-top: 6px; font-size: 12px; color: #9ca3af; padding: 0 2px;
 }
 
-/* 内联表格/图片引用 */
-.inline-table-ref, .inline-image-ref {
-  border: 1px solid #e5e7eb; border-radius: 6px;
-  padding: 8px 10px; margin: 8px 0; background: #fafbfc;
+/* 参考文献卡片内容区 */
+.ref-preview-text { font-size: 12px; color: #9ca3af; }
+
+/* 参考文献卡片 - 表格 */
+.ref-table-wrap {
+  overflow-x: auto;
+  max-height: 260px;
+  overflow-y: auto;
 }
-.inline-ref-label {
-  font-size: 12px; color: #6b7280; margin-bottom: 6px; font-weight: 600;
+.ref-table-wrap :deep(table) {
+  border-collapse: collapse; font-size: 11px; min-width: 100%;
 }
-.inline-ref-content { font-size: 12px; color: #374151; overflow-x: auto; }
-.inline-ref-img { max-width: 100%; max-height: 300px; border-radius: 4px; }
+.ref-table-wrap :deep(th),
+.ref-table-wrap :deep(td) {
+  border: 1px solid #d1d5db; padding: 3px 6px; white-space: nowrap;
+}
+.ref-table-wrap :deep(th) { background: #f3f4f6; font-weight: 600; }
+
+/* 参考文献卡片 - 图片 */
+.ref-image-wrap { display: flex; flex-wrap: wrap; gap: 6px; }
+.ref-img { max-width: 100%; max-height: 200px; border-radius: 4px; object-fit: contain; }
+
+/* 内联表格/图片引用（回答正文中） */
+.answer-content :deep(.inline-table-ref),
+.answer-content :deep(.inline-image-ref) {
+  border: 1px solid #e5e7eb; border-radius: 8px;
+  padding: 10px 12px; margin: 12px 0; background: #fafbfc;
+}
+.answer-content :deep(.inline-ref-label) {
+  font-size: 12px; color: #6b7280; margin-bottom: 8px; font-weight: 600;
+}
+.answer-content :deep(.inline-ref-content) {
+  overflow-x: auto;
+}
+.answer-content :deep(.inline-ref-content table) {
+  border-collapse: collapse; font-size: 12px; min-width: 100%;
+}
+.answer-content :deep(.inline-ref-content th),
+.answer-content :deep(.inline-ref-content td) {
+  border: 1px solid #d1d5db; padding: 4px 8px;
+}
+.answer-content :deep(.inline-ref-content th) { background: #f3f4f6; font-weight: 600; }
+.answer-content :deep(.inline-ref-img) {
+  max-width: 100%; max-height: 400px; border-radius: 6px; display: block; margin: 6px 0;
+}
 </style>

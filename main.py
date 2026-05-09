@@ -206,10 +206,17 @@ async def index_endpoint(req: IndexRequest):
 
     toc_path    = processed_dir / f"{pdf_id}_toc.json"
     blocks_path = processed_dir / f"{pdf_id}_semantic_blocks.json"
+    parent_path = processed_dir / f"{pdf_id}_parent_blocks.json"
+    child_path  = processed_dir / f"{pdf_id}_child_blocks.json"
 
-    # 索引
+    # 索引（若父子块文件存在，一并索引）
     vs = get_vs()
-    vs.build_index_from_files(toc_path=str(toc_path), blocks_path=str(blocks_path))
+    vs.build_index_from_files(
+        toc_path    = str(toc_path),
+        blocks_path = str(blocks_path),
+        parent_path = str(parent_path) if parent_path.exists() else None,
+        child_path  = str(child_path)  if child_path.exists()  else None,
+    )
     stats = vs.stats()
 
     return JSONResponse({
@@ -217,6 +224,8 @@ async def index_endpoint(req: IndexRequest):
         "pdf_id":       pdf_id,
         "toc_path":     str(toc_path),
         "blocks_path":  str(blocks_path),
+        "parent_path":  str(parent_path) if parent_path.exists() else None,
+        "child_path":   str(child_path)  if child_path.exists()  else None,
         "vector_stats": stats,
     })
 

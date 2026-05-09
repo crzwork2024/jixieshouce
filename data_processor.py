@@ -100,6 +100,9 @@ class MinerUProcessor:
     IMAGE_TYPES = {"image", "image_body"}
     TEXT_TYPES  = {"text", "list", "table_caption"}
 
+    # 识别表格标题的正则（如"表 2⁃1⁃1"、"表1-1"、"表 1"）
+    TABLE_CAPTION_RE = re.compile(r"^表[\s\u2003]*[\d\-⁃一二三四五六七八九十]+")
+
     def __init__(self, pdf_id: str, input_dir: str):
         self.pdf_id    = pdf_id
         self.input_dir = Path(input_dir)
@@ -108,7 +111,9 @@ class MinerUProcessor:
         self._raw_pages: list[list[dict]] = []   # pdfData 原始页列表
         self._merge_map: dict[str, dict]  = {}   # id -> 合并后块
         self._toc: list[dict]             = []   # 目录树
-        self._semantic_blocks: list[dict] = []   # 最终语义块列表
+        self._semantic_blocks: list[dict] = []   # 细粒度语义块列表（子块）
+        self._parent_blocks:   list[dict] = []   # 聚合后父块列表
+        self._child_blocks:    list[dict] = []   # 携带 parent_block_id 的子块列表
         self._chapter_stack: list[str]    = []   # 当前章节路径栈
 
     # ────────────────────────────────────────
@@ -117,26 +122,35 @@ class MinerUProcessor:
 
     def run(self) -> dict[str, Any]:
         """完整执行预处理流程，返回处理结果。"""
-        print(f"[1/4] 加载 block_list.json ...")
+        print(f"[1/5] 加载 block_list.json ...")
         self._load_block_list()
 
-        print(f"[2/4] 处理跨页合并关系 ...")
+        print(f"[2/5] 处理跨页合并关系 ...")
         self._process_merge_connections()
 
-        print(f"[3/4] 提取目录结构 ...")
+        print(f"[3/5] 提取目录结构 ...")
         self._extract_toc()
 
-        print(f"[4/4] 生成语义块 ...")
+        print(f"[4/5] 生成细粒度语义块 ...")
         self._build_semantic_blocks()
+
+        print(f"[5/5] 聚合父子块 ...")
+        self._build_parent_groups()
 
         result = {
             "pdf_id": self.pdf_id,
             "toc": self._toc,
             "semantic_blocks": self._semantic_blocks,
+            "parent_blocks": self._parent_blocks,
+            "child_blocks": self._child_blocks,
             "total_blocks": len(self._semantic_blocks),
             "total_pages": len(self._raw_pages),
         }
-        print(f"完成！共生成 {len(self._semantic_blocks)} 个语义块，{len(self._toc)} 个目录节点。")
+        print(
+            f"完成！共生成 {len(self._semantic_blocks)} 个细粒度块，"
+            f"{len(self._parent_blocks)} 个父块，{len(self._child_blocks)} 个子块，"
+            f"{len(self._toc)} 个目录节点。"
+        )
         return result
 
     def save(self, output_dir: str | None = None) -> None:
@@ -146,8 +160,10 @@ class MinerUProcessor:
 
         result = self.run()
 
-        toc_path    = out / f"{self.pdf_id}_toc.json"
-        blocks_path = out / f"{self.pdf_id}_semantic_blocks.json"
+        toc_path          = out / f"{self.pdf_id}_toc.json"
+        blocks_path       = out / f"{self.pdf_id}_semantic_blocks.json"
+        parent_path       = out / f"{self.pdf_id}_parent_blocks.json"
+        child_path        = out / f"{self.pdf_id}_child_blocks.json"
 
         toc_path.write_text(
             json.dumps(result["toc"], ensure_ascii=False, indent=2), encoding="utf-8"
@@ -155,8 +171,16 @@ class MinerUProcessor:
         blocks_path.write_text(
             json.dumps(result["semantic_blocks"], ensure_ascii=False, indent=2), encoding="utf-8"
         )
+        parent_path.write_text(
+            json.dumps(result["parent_blocks"], ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        child_path.write_text(
+            json.dumps(result["child_blocks"], ensure_ascii=False, indent=2), encoding="utf-8"
+        )
         print(f"目录保存至: {toc_path}")
-        print(f"语义块保存至: {blocks_path}")
+        print(f"细粒度语义块保存至: {blocks_path}")
+        print(f"父块保存至: {parent_path}")
+        print(f"子块（带 parent_block_id）保存至: {child_path}")
 
     # ────────────────────────────────────────
     # 内部实现
@@ -393,6 +417,143 @@ class MinerUProcessor:
         if btype == "list":
             return "list"
         return "text"
+
+    # ────────────────────────────────────────
+    # 父子块聚合
+    # ────────────────────────────────────────
+
+    def _is_table_unit_trigger(self, block: dict) -> bool:
+        """判断此块是否触发新的 table_unit 父块。"""
+        btype = block.get("block_type", "")
+        if btype == "table":
+            return True
+        if btype == "text" and self.TABLE_CAPTION_RE.match(block.get("raw_content", "")):
+            return True
+        return False
+
+    def _is_section_trigger(self, block: dict) -> bool:
+        """判断此块是否触发新的 section 父块（标题块）。"""
+        return block.get("block_type") == "title"
+
+    def _build_parent_groups(self) -> None:
+        """
+        将细粒度 _semantic_blocks 聚合为父块（parent_blocks）和带 parent_block_id 的子块（child_blocks）。
+
+        触发新父块的条件（按顺序扫描）：
+        - 遇到 title 块 → 新建 section 父块
+        - 遇到 table / table_caption 文本 → 新建 table_unit 父块
+
+        同一父块内收集紧随其后的 table、image、text、list，
+        直到遇到下一个触发块为止。
+        """
+        self._parent_blocks = []
+        self._child_blocks  = []
+
+        # 当前父块缓冲区
+        current_parent_id:   str | None = None
+        current_parent_type: str | None = None
+        current_children:    list[dict] = []
+        current_chapter:     str        = ""
+
+        def flush_parent() -> None:
+            nonlocal current_parent_id, current_parent_type, current_children, current_chapter
+            if not current_children or current_parent_id is None:
+                return
+
+            # 合并所有子块的 bboxes 和 page_range
+            all_bboxes: list[dict] = []
+            page_set: set[int] = set()
+            parts: list[str] = []
+
+            for child in current_children:
+                all_bboxes.extend(child.get("bboxes", []))
+                page_set.update(child.get("page_range", []))
+                btype = child.get("block_type", "")
+                if btype == "table":
+                    parts.append(child["raw_content"])   # 保留完整 HTML
+                elif btype == "image":
+                    parts.append(child["raw_content"])   # ![图片](...)
+                else:
+                    text = child.get("raw_content", "").strip()
+                    if text:
+                        parts.append(text)
+
+            raw_content   = "\n".join(parts)
+            # search_text 只用纯文本摘要（截短，以免过长）
+            text_parts = []
+            for child in current_children:
+                btype = child.get("block_type", "")
+                if btype == "table":
+                    text_parts.append(child.get("search_text", "")[:300])
+                elif btype == "image":
+                    pass
+                else:
+                    text_parts.append(child.get("search_text", child.get("raw_content", ""))[:200])
+            search_text   = " ".join(t for t in text_parts if t)
+
+            parent_block = {
+                "parent_block_id":  current_parent_id,
+                "parent_type":      current_parent_type,
+                "chapter_path":     current_chapter,
+                "page_range":       sorted(page_set),
+                "bboxes":           all_bboxes,
+                "raw_content":      raw_content,
+                "search_text":      search_text,
+                "child_block_ids":  [c["block_id"] for c in current_children],
+                "pdf_file_id":      self.pdf_id,
+            }
+            self._parent_blocks.append(parent_block)
+
+            # 标记子块
+            for child in current_children:
+                child_with_parent = dict(child)
+                child_with_parent["parent_block_id"] = current_parent_id
+                self._child_blocks.append(child_with_parent)
+
+            current_parent_id   = None
+            current_parent_type = None
+            current_children    = []
+
+        for block in self._semantic_blocks:
+            btype = block.get("block_type", "")
+
+            if self._is_section_trigger(block):
+                flush_parent()
+                current_parent_id   = str(uuid.uuid4())
+                current_parent_type = "section"
+                current_chapter     = block.get("chapter_path", "")
+                current_children    = [block]
+
+            elif self._is_table_unit_trigger(block):
+                # 若当前父块是 section，不 flush（把 table 收入 section 内）
+                # 若当前父块是 table_unit，则先 flush 再新建
+                if current_parent_type == "table_unit":
+                    flush_parent()
+                    current_parent_id   = str(uuid.uuid4())
+                    current_parent_type = "table_unit"
+                    current_chapter     = block.get("chapter_path", "")
+                    current_children    = [block]
+                elif current_parent_type == "section":
+                    # 在 section 内部遇到 table，直接收入 section
+                    current_children.append(block)
+                else:
+                    # 还没有父块，新建 table_unit
+                    current_parent_id   = str(uuid.uuid4())
+                    current_parent_type = "table_unit"
+                    current_chapter     = block.get("chapter_path", "")
+                    current_children    = [block]
+
+            else:
+                if current_parent_id is None:
+                    # 文档开头无标题的孤立块，新建 section 父块
+                    current_parent_id   = str(uuid.uuid4())
+                    current_parent_type = "section"
+                    current_chapter     = block.get("chapter_path", "")
+                    current_children    = [block]
+                else:
+                    current_children.append(block)
+
+        flush_parent()
 
 
 # ─────────────────────────────────────────────

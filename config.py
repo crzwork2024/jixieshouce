@@ -39,8 +39,10 @@ CHROMA_DIR:   Path = Path(os.getenv("CHROMA_DIR"))
 FRONTEND_DIR: Path = Path(os.getenv("FRONTEND_DIR"))
 
 # ── ChromaDB Collection 名 ─────────────────────────────────
-TOC_COLLECTION_NAME:    str = os.getenv("TOC_COLLECTION_NAME")
-BLOCKS_COLLECTION_NAME: str = os.getenv("BLOCKS_COLLECTION_NAME")
+TOC_COLLECTION_NAME:          str = os.getenv("TOC_COLLECTION_NAME")
+BLOCKS_COLLECTION_NAME:       str = os.getenv("BLOCKS_COLLECTION_NAME")
+CHILD_CHUNKS_COLLECTION_NAME: str = os.getenv("CHILD_CHUNKS_COLLECTION_NAME")
+PARENT_BLOCKS_COLLECTION_NAME: str = os.getenv("PARENT_BLOCKS_COLLECTION_NAME")
 
 
 def validate() -> None:
