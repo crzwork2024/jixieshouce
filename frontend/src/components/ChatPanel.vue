@@ -100,7 +100,8 @@
           :autosize="{ minRows: 2, maxRows: 5 }"
           placeholder="输入问题... (Ctrl+Enter 发送)"
           resize="none"
-          @keydown.ctrl.enter.prevent="sendQuery"
+          @keydown.enter.exact.prevent="sendQuery"
+        @keydown.ctrl.enter.prevent="sendQuery"
         />
         <el-button
           type="primary"
@@ -111,7 +112,7 @@
         >发送</el-button>
       </div>
       <div class="input-hint">
-        <span>Ctrl+Enter 发送</span>
+        <span>Enter 发送 · Shift+Enter 换行</span>
         <el-switch v-model="streamMode" size="small" active-text="流式" />
       </div>
     </div>
