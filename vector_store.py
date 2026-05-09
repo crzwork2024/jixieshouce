@@ -380,8 +380,7 @@ class VectorStore:
             where_conditions.append({"pdf_file_id": {"$eq": pdf_file_id}})
         if block_type_filter:
             where_conditions.append({"block_type": {"$eq": block_type_filter}})
-        if chapter_paths:
-            where_conditions.append({"chapter_path": {"$in": chapter_paths}})
+        # 不在 Chroma 侧用 chapter_path $in：与层级路径不兼容，改为向量检索后再 Python 过滤
 
         where = None
         if len(where_conditions) == 1:
@@ -390,17 +389,26 @@ class VectorStore:
             where = {"$and": where_conditions}
 
         total = self._child_col.count()
+        fetch_n = min(total, max(top_k * 15, 60))
         results = self._child_col.query(
             query_texts=[query],
-            n_results=min(top_k * 3, total),
+            n_results=max(1, fetch_n),
             where=where,
         )
         child_hits = self._parse_results(results)
 
+        if chapter_paths:
+            filtered = [
+                c for c in child_hits
+                if _chapter_path_matches_toc_filter(c.get("chapter_path", ""), chapter_paths)
+            ]
+            if filtered:
+                child_hits = filtered
+
         # 按 parent_block_id 去重，保留最高分
         seen_parents: dict[str, dict] = {}
         for child in child_hits:
-            pid = child.get("parent_block_id") or child["id"]
+            pid = (child.get("parent_block_id") or "").strip() or child["id"]
             if pid not in seen_parents or child["score"] > seen_parents[pid]["score"]:
                 seen_parents[pid] = child
 
@@ -410,7 +418,7 @@ class VectorStore:
         # 拉取完整父块（含完整 raw_content / HTML 表格 / 图片）
         enriched: list[dict] = []
         for child_hit in top_parents:
-            pid = child_hit.get("parent_block_id") or child_hit["id"]
+            pid = (child_hit.get("parent_block_id") or "").strip() or child_hit["id"]
             parent = self.get_parent_block(pid)
             if parent:
                 enriched.append({
@@ -440,8 +448,7 @@ class VectorStore:
             where_conditions.append({"pdf_file_id": {"$eq": pdf_file_id}})
         if block_type_filter:
             where_conditions.append({"block_type": {"$eq": block_type_filter}})
-        if chapter_paths:
-            where_conditions.append({"chapter_path": {"$in": chapter_paths}})
+        # chapter_path：不在 DB 侧 $in（层级路径与 TOC 短标题不一致）
 
         where = None
         if len(where_conditions) == 1:
@@ -453,12 +460,20 @@ class VectorStore:
         if total == 0:
             return []
 
+        fetch_n = min(total, max(top_k * 12, 48))
         results = self._blocks_col.query(
             query_texts=[query],
-            n_results=min(top_k * 2, total),
+            n_results=max(1, fetch_n),
             where=where,
         )
         candidates = self._parse_results(results)
+        if chapter_paths:
+            filtered = [
+                c for c in candidates
+                if _chapter_path_matches_toc_filter(c.get("chapter_path", ""), chapter_paths)
+            ]
+            if filtered:
+                candidates = filtered
         ranked = _rerank_by_keyword(query, candidates)
         return ranked[:top_k]
 
@@ -555,6 +570,8 @@ class VectorStore:
                 "pdf_file_id":  meta.get("pdf_file_id", ""),
                 "raw_content":  meta.get("raw_content", doc),
                 "document":     doc,
+                # child_chunks 写入，用于子→父聚合（此前遗漏会导致永远按子块 id 取父块失败）
+                "parent_block_id": (meta.get("parent_block_id") or "").strip(),
                 # toc 专有
                 "title":        meta.get("title", ""),
                 "page_idx":     meta.get("page_idx", 0),
@@ -601,6 +618,32 @@ def _safe_json_load(s: Any) -> Any:
         return json.loads(s)
     except Exception:
         return []
+
+
+def _chapter_path_matches_toc_filter(block_path: str, toc_hints: list[str]) -> bool:
+    """
+    TOC 命中节点多为短标题（如「5 字体…」「字体的基本要求」），
+    而子块 chapter_path 常为「大节 > 小节」层级字符串。
+    Chroma 的 metadata $in 精确匹配会把绝大部分正文子块全部过滤掉，
+    导致只能命中少数路径恰好等于短标题的块（多为标题行）。
+    """
+    if not toc_hints:
+        return True
+    bp = (block_path or "").strip()
+    if not bp:
+        return False
+    segments = [s.strip() for s in re.split(r"\s*>\s*", bp) if s.strip()]
+    for hint in toc_hints:
+        h = (hint or "").strip()
+        if not h:
+            continue
+        if bp == h:
+            return True
+        if h in segments:
+            return True
+        if bp.startswith(h + " >") or bp.startswith(h + ">"):
+            return True
+    return False
 
 
 # ─────────────────────────────────────────────

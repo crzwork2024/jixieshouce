@@ -103,6 +103,19 @@ class MinerUProcessor:
     # 识别表格标题的正则（如"表 2⁃1⁃1"、"表1-1"、"表 1"）
     TABLE_CAPTION_RE = re.compile(r"^表[\s\u2003]*[\d\-⁃一二三四五六七八九十]+")
 
+    # 「大节」起点：在此处 flush 并新建 section 父块。MinerU 常把小节题也标成 title，
+    # 若每个 title 都切段会产生「只有章节名、正文在下一块」的空壳父块。
+    MAJOR_SECTION_TITLE_RE = re.compile(
+        r"^(?:"
+        r"第\s*[一二三四五六七八九十百千零〇两\d]+\s*章"  # 第 2 章 …
+        r"|"
+        r"\d+(?:\.\d+){1,3}[\s\.、．]"  # 1.2 / 2.3.1 等多级节号
+        r"|"
+        r"\d+[\s\u3000]+(?=\S)"  # 「5 字体…」「4 比例 …」行首阿拉伯数字节号
+        r")",
+        re.UNICODE,
+    )
+
     def __init__(self, pdf_id: str, input_dir: str):
         self.pdf_id    = pdf_id
         self.input_dir = Path(input_dir)
@@ -372,9 +385,9 @@ class MinerUProcessor:
             raw_content = html
             search_text = html_table_to_text(html)
         elif btype in self.IMAGE_TYPES:
-            img_path = block.get("img_path", "")
-            raw_content = f"![图片](images/{img_path})" if img_path else "![图片]"
-            search_text = f"图片: {img_path}"
+            rel = self._normalize_mineru_img_rel(block.get("img_path", ""))
+            raw_content = f"![图片](images/{rel})" if rel else "![图片]"
+            search_text = f"图片: {rel}" if rel else "图片"
         else:
             text = block.get("text", "").strip()
             if not text:
@@ -382,7 +395,7 @@ class MinerUProcessor:
             raw_content = text
             search_text = text
 
-        return {
+        sem = {
             "block_id":      block.get("id", str(uuid.uuid4())),
             "chapter_path":  self._current_chapter_path(),
             "page_range":    [pidx],
@@ -392,6 +405,9 @@ class MinerUProcessor:
             "search_text":   search_text,
             "pdf_file_id":   self.pdf_id,
         }
+        if btype in self.TITLE_TYPES:
+            sem["title_level"] = block.get("level", 1)
+        return sem
 
     def _make_semantic_block_from_merged(self, merged: dict) -> dict:
         btype = merged.get("type", "text")
@@ -406,6 +422,17 @@ class MinerUProcessor:
             "pdf_file_id":  self.pdf_id,
             "is_merged":    True,
         }
+
+    @staticmethod
+    def _normalize_mineru_img_rel(img_path: str) -> str:
+        """统一为 images/ 下的相对文件名，避免出现 images//xxx。"""
+        p = (img_path or "").strip().replace("\\", "/")
+        while "//" in p:
+            p = p.replace("//", "/")
+        p = p.lstrip("/")
+        if p.lower().startswith("images/"):
+            p = p[7:].lstrip("/")
+        return p
 
     def _normalize_type(self, btype: str) -> str:
         if btype in self.TITLE_TYPES:
@@ -432,19 +459,30 @@ class MinerUProcessor:
         return False
 
     def _is_section_trigger(self, block: dict) -> bool:
-        """判断此块是否触发新的 section 父块（标题块）。"""
+        """是否为标题块（MinerU title）。"""
         return block.get("block_type") == "title"
+
+    def _is_major_section_title(self, block: dict) -> bool:
+        """
+        是否视为「大节」起点（需要 flush 后新建 section）。
+        不匹配的行仍可能是 title（如「字体的基本要求」），应并入当前 section。
+        """
+        if block.get("block_type") != "title":
+            return False
+        text = block.get("raw_content", "").strip().lstrip("#").strip()
+        return bool(self.MAJOR_SECTION_TITLE_RE.match(text))
 
     def _build_parent_groups(self) -> None:
         """
         将细粒度 _semantic_blocks 聚合为父块（parent_blocks）和带 parent_block_id 的子块（child_blocks）。
 
         触发新父块的条件（按顺序扫描）：
-        - 遇到 title 块 → 新建 section 父块
-        - 遇到 table / table_caption 文本 → 新建 table_unit 父块
+        - 遇到「大节」title（第 X 章 / 行首数字节号 / 多级节号 1.2）→ 新建 section 父块
+        - 其它 title（小节题）→ 并入当前 section，不断开
+        - 遇到 table / table_caption 文本 → 按 table_unit 规则处理（见分支逻辑）
 
         同一父块内收集紧随其后的 table、image、text、list，
-        直到遇到下一个触发块为止。
+        直到遇到下一个大节 title 或 table_unit 边界为止。
         """
         self._parent_blocks = []
         self._child_blocks  = []
@@ -518,11 +556,20 @@ class MinerUProcessor:
             btype = block.get("block_type", "")
 
             if self._is_section_trigger(block):
-                flush_parent()
-                current_parent_id   = str(uuid.uuid4())
-                current_parent_type = "section"
-                current_chapter     = block.get("chapter_path", "")
-                current_children    = [block]
+                if self._is_major_section_title(block):
+                    flush_parent()
+                    current_parent_id   = str(uuid.uuid4())
+                    current_parent_type = "section"
+                    current_chapter     = block.get("chapter_path", "")
+                    current_children    = [block]
+                else:
+                    if current_parent_id is None:
+                        current_parent_id   = str(uuid.uuid4())
+                        current_parent_type = "section"
+                        current_chapter     = block.get("chapter_path", "")
+                        current_children    = [block]
+                    else:
+                        current_children.append(block)
 
             elif self._is_table_unit_trigger(block):
                 # 若当前父块是 section，不 flush（把 table 收入 section 内）

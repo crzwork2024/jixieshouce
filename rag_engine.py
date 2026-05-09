@@ -304,11 +304,13 @@ class RAGEngine:
         resp = _call_llm(messages, stream=False)
         raw_answer = resp.json()["choices"][0]["message"]["content"]
         processed_answer = self._post_process_answer(raw_answer, blocks)
+        refs = self._build_references(blocks)
+        refs = filter_references_by_answer_citations(processed_answer, refs)
 
         return {
             "query":      query,
             "answer":     processed_answer,
-            "references": self._build_references(blocks),
+            "references": refs,
             "blocks":     blocks,
         }
 
@@ -344,8 +346,8 @@ class RAGEngine:
 
             # 判断 raw_content 中是否含 HTML 表格
             has_html_table = "<table" in raw_content.lower() if raw_content else False
-            # 提取图片路径列表（格式：![...](images/xxx.png)）
-            img_paths = re.findall(r"!\[.*?\]\((images/[^)]+)\)", raw_content)
+            # 提取 Markdown 图片路径，规范化为 images/ 下的相对文件名（无双斜杠）
+            img_paths = _normalized_img_paths_from_raw(raw_content)
 
             refs.append({
                 "index":         i,
@@ -386,6 +388,67 @@ class RAGEngine:
 # ─────────────────────────────────────────────
 # 工具函数
 # ─────────────────────────────────────────────
+
+def _normalized_img_paths_from_raw(raw: str | None) -> list[str]:
+    """从 raw_content 中解析 ![alt](url)，规范化为 images/ 目录下的相对文件名。"""
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in re.finditer(r"!\[[^\]]*\]\(([^)]+)\)", raw or ""):
+        u = m.group(1).strip().strip("\"'")
+        u = u.replace("\\", "/")
+        while "//" in u:
+            u = u.replace("//", "/")
+        u = u.lstrip("/")
+        if u.lower().startswith("images/"):
+            u = u[7:].lstrip("/")
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def filter_references_by_answer_citations(answer_text: str, references: list[dict]) -> list[dict]:
+    """
+    仅保留回答中实际引用到的参考文献条目：
+    - 角标 [1]、[2] …
+    - 正文中的图表占位（post 后为 <!-- EMBED_*:block_id -->，或未转换的 {{TABLE:id}} / {{IMAGE:id}}）
+
+    若未检测到任何引用符号且无任何占位符，则返回原列表（避免模型漏标时侧边栏为空）。
+    """
+    if not references or not (answer_text or "").strip():
+        return list(references)
+
+    cited_idx = {int(m.group(1)) for m in re.finditer(r"\[(\d+)\]", answer_text)}
+    embed_ids: set[str] = set()
+    embed_ids.update(re.findall(r"<!--\s*EMBED_(?:TABLE|IMAGE):([^\s>]+)\s*-->", answer_text))
+    embed_ids.update(re.findall(r"\{\{IMAGE:([^}]+)\}\}", answer_text))
+    embed_ids.update(re.findall(r"\{\{TABLE:([^}]+)\}\}", answer_text))
+
+    has_signal = bool(cited_idx or embed_ids)
+    if not has_signal:
+        return list(references)
+
+    by_idx = {r["index"]: r for r in references}
+    picked: dict[str, dict] = {}
+
+    for idx in sorted(cited_idx):
+        r = by_idx.get(idx)
+        if r:
+            picked[r["block_id"]] = r
+
+    if embed_ids:
+        by_block = {r["block_id"]: r for r in references}
+        for bid in embed_ids:
+            if bid in by_block:
+                picked[bid] = by_block[bid]
+
+    if not picked:
+        return list(references)
+
+    out = list(picked.values())
+    out.sort(key=lambda r: r["index"])
+    return out
+
 
 def _table_preview(html: str, max_rows: int = 3) -> str:
     """提取表格前几行作为预览文本。"""

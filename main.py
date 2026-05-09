@@ -31,7 +31,7 @@ from config import CHROMA_DIR, FRONTEND_DIR
 _BASE = Path(__file__).parent
 DATA_DIR = (_BASE / config.DATA_DIR) if not config.DATA_DIR.is_absolute() else config.DATA_DIR
 from data_processor import MinerUProcessor, detect_pdf_id
-from rag_engine import RAGEngine
+from rag_engine import RAGEngine, filter_references_by_answer_citations
 from vector_store import VectorStore, _auto_find_processed
 
 # ─────────────────────────────────────────────
@@ -122,7 +122,7 @@ async def query_endpoint(req: QueryRequest):
         gen     = result["stream"]
 
         async def event_generator():
-            # 先发送引用元数据
+            # 先发送引用元数据（流式结束后可能被 done 事件收窄）
             meta_event = json.dumps({
                 "type":       "meta",
                 "references": refs,
@@ -130,12 +130,21 @@ async def query_endpoint(req: QueryRequest):
             }, ensure_ascii=False)
             yield f"data: {meta_event}\n\n"
 
-            # 逐 token 发送
+            chunks: list[str] = []
             for token in gen:
+                chunks.append(token)
                 chunk_event = json.dumps({"type": "token", "content": token}, ensure_ascii=False)
                 yield f"data: {chunk_event}\n\n"
 
-            yield "data: {\"type\": \"done\"}\n\n"
+            combined = "".join(chunks)
+            processed = engine._post_process_answer(combined, blocks)
+            filtered_refs = filter_references_by_answer_citations(processed, refs)
+            done_event = json.dumps({
+                "type": "done",
+                "references": filtered_refs,
+                "answer": processed,
+            }, ensure_ascii=False)
+            yield f"data: {done_event}\n\n"
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 

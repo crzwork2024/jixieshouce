@@ -70,11 +70,11 @@
                       :type="typeTagMap[ref.block_type] || 'info'"
                     >{{ typeLabel(ref.block_type) }}</el-tag>
                   </div>
-                  <!-- 表格类型：渲染完整 HTML 表格 -->
+                  <!-- 表格 / Markdown 图片混排 -->
                   <div
-                    v-if="ref.has_html_table"
-                    class="ref-preview ref-table-wrap"
-                    v-html="sanitizeTable(ref.raw_content)"
+                    v-if="refNeedsRichPreview(ref)"
+                    class="ref-preview ref-table-wrap ref-rich-wrap"
+                    v-html="sanitizeRichPreview(ref.raw_content)"
                   />
                   <!-- 图片类型：渲染图片 -->
                   <div
@@ -84,10 +84,10 @@
                     <img
                       v-for="(path, idx) in ref.img_paths"
                       :key="idx"
-                      :src="`/images/${path.replace('images/', '')}`"
+                      :src="resolveImageSrc(path)"
                       class="ref-img"
                       :alt="`图片 ${idx + 1}`"
-                      onerror="this.style.display='none'"
+                      loading="lazy"
                     />
                     <span v-if="!ref.img_paths || !ref.img_paths.length" class="ref-preview-text">[图片]</span>
                   </div>
@@ -192,16 +192,20 @@ function sanitize(html) {
   })
 }
 
-/** 表格 HTML 净化（允许 table 相关标签，禁止脚本/外链） */
+/** 表格 HTML 净化（允许 table + 内嵌 img，便于「表 + 示意图」混排） */
 function sanitizeTable(html) {
   return DOMPurify.sanitize(html || '', {
     ALLOWED_TAGS: [
       'table', 'thead', 'tbody', 'tfoot', 'tr', 'th', 'td',
       'colgroup', 'col', 'caption',
       'b', 'strong', 'em', 'br', 'span', 'p', 'sup', 'sub',
+      'img',
     ],
-    ALLOWED_ATTR: ['colspan', 'rowspan', 'align', 'valign', 'style', 'class'],
-    FORBID_ATTR: ['onclick', 'onerror', 'onload'],
+    ALLOWED_ATTR: [
+      'colspan', 'rowspan', 'align', 'valign', 'style', 'class',
+      'src', 'alt', 'loading',
+    ],
+    FORBID_ATTR: ['onclick'],
   })
 }
 
@@ -222,6 +226,64 @@ function typeLabel(t) {
   return map[t] || t
 }
 
+/** 统一转为前端请求的 /images/{文件名}，修正 images//、重复前缀等 */
+function resolveImageSrc(stored) {
+  let u = String(stored || '').trim().replace(/\\/g, '/')
+  while (u.includes('//')) u = u.replace(/\/\//g, '/')
+  u = u.replace(/^\/+/, '')
+  if (u.toLowerCase().startsWith('images/')) {
+    u = u.slice('images/'.length).replace(/^\/+/, '')
+  }
+  return `/images/${u}`
+}
+
+/** 将 Markdown 图片语法转为 <img>（路径经 resolveImageSrc） */
+function markdownImagesToImgHtml(text) {
+  return (text || '').replace(/!\[[^\]]*\]\(([^)]+)\)/g, (_, url) => {
+    const src = resolveImageSrc(url.trim())
+    return `<img src="${src}" class="ref-inline-img" alt="" loading="lazy"/>`
+  })
+}
+
+/** 参考文献卡：表格 + Markdown 图混排 */
+function sanitizeRichPreview(raw) {
+  const html = markdownImagesToImgHtml(raw || '')
+  const wrapped = `<div class="rich-ref-root">${html}</div>`
+  return DOMPurify.sanitize(wrapped, {
+    ALLOWED_TAGS: [
+      'table', 'thead', 'tbody', 'tfoot', 'tr', 'th', 'td',
+      'colgroup', 'col', 'caption',
+      'b', 'strong', 'em', 'br', 'span', 'p', 'sup', 'sub',
+      'img',
+      'div',
+    ],
+    ALLOWED_ATTR: [
+      'colspan', 'rowspan', 'align', 'valign', 'style', 'class',
+      'src', 'alt', 'loading',
+    ],
+    FORBID_ATTR: ['onclick'],
+  })
+}
+
+function refNeedsRichPreview(ref) {
+  const raw = ref.raw_content || ''
+  return ref.has_html_table || /\!\[[^\]]*\]\([^)]+\)/.test(raw)
+}
+
+function findRefForEmbed(references, bid) {
+  if (!references?.length || bid == null || bid === '') return null
+  let ref = references.find(r => r.block_id === bid)
+  if (ref) return ref
+  const b = String(bid).trim()
+  ref = references.find(r => (r.raw_content || '').includes(b))
+  if (ref) return ref
+  if (b.length >= 16 && /^[a-fA-F0-9-]+$/.test(b.replace(/-/g, ''))) {
+    const hex = b.replace(/-/g, '').toLowerCase()
+    ref = references.find(r => (r.raw_content || '').toLowerCase().includes(hex))
+  }
+  return ref || null
+}
+
 /**
  * 将回答文本渲染为 HTML：
  * 1. Markdown 解析
@@ -240,24 +302,31 @@ function renderAnswer(content, references) {
     return `<span class="${cls}" data-ref="${n}" title="${ref ? ref.chapter : ''}">[${n}]</span>`
   })
 
-  // <!-- EMBED_TABLE:id --> → 实际表格
+  // <!-- EMBED_TABLE:id --> → 实际表格（可与 Markdown 图混排）
   html = html.replace(/<!--\s*EMBED_TABLE:([^\s>]+)\s*-->/g, (_, bid) => {
-    const ref = (references || []).find(r => r.block_id === bid)
+    const ref = findRefForEmbed(references, bid)
     if (!ref) return `<em>[表格 ${bid} 未找到]</em>`
-    const tableHtml = sanitizeTable(ref.raw_content)
+    const inner = sanitizeRichPreview(ref.raw_content)
     return `<div class="inline-table-ref" data-ref="${ref.index}">
       <div class="inline-ref-label">&#128202; 表格引用 [${ref.index}] · ${ref.chapter} · ${ref.page_label}</div>
-      <div class="inline-ref-content">${tableHtml}</div>
+      <div class="inline-ref-content">${inner}</div>
     </div>`
   })
 
-  // <!-- EMBED_IMAGE:id --> → 实际图片
+  // <!-- EMBED_IMAGE:id --> → 实际图片（block_id 或正文/文件名片段）
   html = html.replace(/<!--\s*EMBED_IMAGE:([^\s>]+)\s*-->/g, (_, bid) => {
-    const ref = (references || []).find(r => r.block_id === bid)
+    const ref = findRefForEmbed(references, bid)
     if (!ref) return `<em>[图片 ${bid} 未找到]</em>`
-    const imgs = (ref.img_paths || [])
-      .map(p => `<img src="/images/${p.replace('images/', '')}" class="inline-ref-img" alt="图片" onerror="this.style.display='none'"/>`)
+    let imgs = (ref.img_paths || [])
+      .map(p => `<img src="${resolveImageSrc(p)}" class="inline-ref-img" alt="" loading="lazy"/>`)
       .join('')
+    if (!imgs && ref.raw_content) {
+      imgs = markdownImagesToImgHtml(ref.raw_content)
+      imgs = DOMPurify.sanitize(imgs, {
+        ALLOWED_TAGS: ['img'],
+        ALLOWED_ATTR: ['src', 'alt', 'class', 'loading'],
+      })
+    }
     return `<div class="inline-image-ref" data-ref="${ref.index}">
       <div class="inline-ref-label">&#128444; 图片引用 [${ref.index}] · ${ref.chapter} · ${ref.page_label}</div>
       ${imgs || '<span>[图片加载失败]</span>'}
@@ -384,6 +453,12 @@ async function sendStream(query, msgId) {
             await scrollToBottom()
           } else if (evt.type === 'done') {
             assistantMsg.streaming = false
+            if (evt.answer != null && evt.answer !== '') {
+              assistantMsg.content = evt.answer
+            }
+            if (Array.isArray(evt.references)) {
+              assistantMsg.references = evt.references
+            }
           }
         } catch (_) {}
       }
@@ -513,6 +588,13 @@ defineExpose({ sendQuery: (q) => { inputText.value = q; sendQuery() } })
   border: 1px solid #d1d5db; padding: 3px 6px; white-space: nowrap;
 }
 .ref-table-wrap :deep(th) { background: #f3f4f6; font-weight: 600; }
+.ref-table-wrap :deep(img),
+.ref-rich-wrap :deep(img),
+.ref-rich-wrap :deep(.rich-ref-root img) {
+  max-width: 100%; height: auto; vertical-align: middle;
+  margin: 6px 0; border-radius: 4px; display: inline-block;
+}
+.ref-rich-wrap :deep(.rich-ref-root) { font-size: 12px; color: #374151; line-height: 1.45; }
 
 /* 参考文献卡片 - 图片 */
 .ref-image-wrap { display: flex; flex-wrap: wrap; gap: 6px; }
@@ -539,6 +621,10 @@ defineExpose({ sendQuery: (q) => { inputText.value = q; sendQuery() } })
 }
 .answer-content :deep(.inline-ref-content th) { background: #f3f4f6; font-weight: 600; }
 .answer-content :deep(.inline-ref-img) {
+  max-width: 100%; max-height: 400px; border-radius: 6px; display: block; margin: 6px 0;
+}
+.answer-content :deep(.inline-ref-content img),
+.answer-content :deep(.inline-ref-content .ref-inline-img) {
   max-width: 100%; max-height: 400px; border-radius: 6px; display: block; margin: 6px 0;
 }
 </style>
