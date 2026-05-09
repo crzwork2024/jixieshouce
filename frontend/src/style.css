@@ -1,0 +1,129 @@
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+               'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  background: #f0f2f5;
+  color: #1a1a1a;
+  height: 100vh;
+  overflow: hidden;
+}
+
+#app { height: 100vh; display: flex; flex-direction: column; }
+
+/* ── 滚动条美化 ── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: #f1f1f1; border-radius: 3px; }
+::-webkit-scrollbar-thumb { background: #c1c1c1; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #a8a8a8; }
+
+/* ── PDF 高亮层 ── */
+.pdf-highlight-layer {
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%; height: 100%;
+  pointer-events: none;
+  z-index: 10;
+}
+
+.pdf-highlight-rect {
+  position: absolute;
+  background: rgba(255, 213, 0, 0.38);
+  border: 2px solid rgba(255, 165, 0, 0.8);
+  border-radius: 2px;
+  pointer-events: none;
+  animation: highlight-pulse 0.4s ease-out;
+}
+
+@keyframes highlight-pulse {
+  0%   { background: rgba(255, 213, 0, 0.7); }
+  100% { background: rgba(255, 213, 0, 0.38); }
+}
+
+/* ── 回答区 Markdown 样式 ── */
+.answer-content { line-height: 1.8; font-size: 14px; }
+.answer-content h1, .answer-content h2, .answer-content h3 {
+  margin: 12px 0 8px; color: #1d3557; font-weight: 600;
+}
+.answer-content p { margin-bottom: 10px; }
+.answer-content ul, .answer-content ol {
+  padding-left: 20px; margin-bottom: 10px;
+}
+.answer-content li { margin-bottom: 4px; }
+.answer-content table {
+  border-collapse: collapse; width: 100%; margin: 12px 0;
+  font-size: 13px; overflow-x: auto; display: block;
+}
+.answer-content th, .answer-content td {
+  border: 1px solid #d0d7de; padding: 6px 10px; text-align: left;
+}
+.answer-content th {
+  background: #f6f8fa; font-weight: 600; color: #24292f;
+}
+.answer-content tr:nth-child(even) td { background: #fafbfc; }
+.answer-content code {
+  background: #f0f0f0; padding: 2px 5px; border-radius: 3px;
+  font-family: 'JetBrains Mono', 'Consolas', monospace; font-size: 12px;
+}
+.answer-content blockquote {
+  border-left: 4px solid #4361ee; background: #f0f4ff;
+  padding: 8px 14px; margin: 10px 0; border-radius: 0 6px 6px 0; color: #555;
+}
+
+/* ── 引用角标 ── */
+.cite-badge {
+  display: inline-block; background: #4361ee; color: #fff;
+  font-size: 11px; font-weight: 700; padding: 1px 5px;
+  border-radius: 3px; cursor: pointer; margin: 0 2px;
+  vertical-align: super; line-height: 1;
+  transition: background 0.2s;
+}
+.cite-badge:hover { background: #3046c5; }
+.cite-badge.active { background: #e63946; }
+
+/* ── 参考文献卡片 ── */
+.ref-card {
+  border: 1px solid #e4e7ed; border-radius: 8px;
+  padding: 12px 14px; margin-bottom: 10px;
+  cursor: pointer; transition: all 0.2s;
+  background: #fff;
+}
+.ref-card:hover { border-color: #4361ee; box-shadow: 0 2px 8px rgba(67,97,238,0.12); }
+.ref-card.active { border-color: #4361ee; background: #f0f4ff; }
+.ref-card .ref-header {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 6px;
+}
+.ref-index {
+  display: inline-block; width: 22px; height: 22px; line-height: 22px;
+  text-align: center; background: #4361ee; color: #fff;
+  font-size: 12px; font-weight: 700; border-radius: 4px; flex-shrink: 0;
+}
+.ref-chapter { font-size: 13px; color: #555; flex: 1; }
+.ref-page { font-size: 12px; color: #999; white-space: nowrap; }
+.ref-preview {
+  font-size: 12px; color: #666; background: #f6f8fa;
+  border-radius: 4px; padding: 6px 8px; margin-top: 6px;
+  border-left: 3px solid #d0d7de;
+  overflow: hidden; display: -webkit-box;
+  -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+}
+
+/* ── 目录侧边栏 ── */
+.toc-item {
+  display: flex; align-items: center; padding: 5px 8px;
+  border-radius: 5px; cursor: pointer; transition: all 0.15s;
+  font-size: 13px; color: #374151; line-height: 1.4;
+}
+.toc-item:hover { background: #eef2ff; color: #4361ee; }
+.toc-item.active { background: #dde9ff; color: #2c4ecf; font-weight: 600; }
+.toc-item .toc-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: #4361ee; flex-shrink: 0; margin-right: 6px;
+}
+
+/* ── 输入区 ── */
+.query-input-wrap { position: relative; }
+.query-send-btn {
+  position: absolute; right: 8px; bottom: 8px;
+  padding: 6px 16px; font-size: 13px;
+}
