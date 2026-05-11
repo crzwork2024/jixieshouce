@@ -31,6 +31,7 @@
         class="pdf-page-wrap"
         :ref="el => setPageRef(el, p.pageNum)"
         :data-page="p.pageNum"
+        :style="pageMinHeightStyle(p.pageNum)"
       >
         <canvas :ref="el => setCanvasRef(el, p.pageNum)" />
         <!-- 高亮层 -->
@@ -82,23 +83,46 @@ const pageWrapRefs  = {}
 let pdfDoc     = null
 const renderedPages = ref([])   // [{pageNum}]
 const renderQueue   = new Set()
+/** 各页在现行 scale 下的视口高度（px），用于占位，避免未渲染页高度为 0 导致 offsetTop / 滚动位置错误 */
+const pageViewportHeights = ref([])
 
 // ── Ref 注册 ─────────────────────────────────
 function setCanvasRef(el, num)    { if (el) canvasRefs[num] = el }
 function setHighlightRef(el, num) { if (el) highlightRefs[num] = el }
 function setPageRef(el, num)      { if (el) pageWrapRefs[num] = el }
 
+function pageMinHeightStyle(pageNum) {
+  const h = pageViewportHeights.value[pageNum - 1]
+  return h ? { minHeight: `${h}px` } : {}
+}
+
+async function measureAllPageHeights() {
+  pageViewportHeights.value = []
+  if (!pdfDoc) return
+  const n = pdfDoc.numPages
+  const heights = new Array(n)
+  for (let i = 1; i <= n; i++) {
+    const page = await pdfDoc.getPage(i)
+    const viewport = page.getViewport({ scale: scale.value })
+    heights[i - 1] = viewport.height
+  }
+  pageViewportHeights.value = heights
+}
+
 // ── 加载 PDF ─────────────────────────────────
 async function loadPdf(url) {
   if (!url) return
   loading.value = true
   renderedPages.value = []
+  pageViewportHeights.value = []
   currentPage.value = 1
   totalPages.value   = 0
 
   try {
     pdfDoc = await pdfjsLib.getDocument({ url, cMapUrl: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.3.136/cmaps/', cMapPacked: true }).promise
     totalPages.value = pdfDoc.numPages
+
+    await measureAllPageHeights()
 
     // 先生成页面占位符
     renderedPages.value = Array.from({ length: pdfDoc.numPages }, (_, i) => ({ pageNum: i + 1 }))
@@ -207,6 +231,8 @@ async function resetZoom(){ scale.value = 1.4; await rerenderAll() }
 async function rerenderAll() {
   renderQueue.clear()
   clearHighlights()
+  await measureAllPageHeights()
+  await nextTick()
   const visible = [...Object.keys(canvasRefs)].slice(0, 5).map(Number)
   for (const num of visible) await renderPage(num)
   applyAllHighlights()
@@ -216,16 +242,37 @@ async function rerenderAll() {
 function prevPage() { if (currentPage.value > 1) jumpToPage(currentPage.value - 1) }
 function nextPage() { if (currentPage.value < totalPages.value) jumpToPage(currentPage.value + 1) }
 
+function scrollWrapIntoScrollArea(wrap, behavior = 'smooth') {
+  const sa = scrollArea.value
+  if (!wrap || !sa) return
+  // 不用 offsetTop（offsetParent 链不可靠）；用视口差值 + 当前 scrollTop
+  const top =
+    wrap.getBoundingClientRect().top -
+    sa.getBoundingClientRect().top +
+    sa.scrollTop -
+    16
+  const maxScroll = Math.max(0, sa.scrollHeight - sa.clientHeight)
+  sa.scrollTo({ top: Math.max(0, Math.min(top, maxScroll)), behavior })
+}
+
 async function jumpToPage(num) {
   if (!num || num < 1) return
   currentPage.value = num
-  // 先确保该页已渲染
-  await renderPage(num)
-  await nextTick()
-  // 在自定义滚动容器内用 scrollTo，比 scrollIntoView 更可靠
-  const wrap = pageWrapRefs[num]
-  if (wrap && scrollArea.value) {
-    scrollArea.value.scrollTo({ top: wrap.offsetTop - 16, behavior: 'smooth' })
+  // refs 与 canvas 可能尚未就绪（首触目录 / PDF 刚加载），短重试 scroll
+  const maxAttempts = 12
+  for (let i = 0; i < maxAttempts; i++) {
+    await renderPage(num)
+    await nextTick()
+    const wrap = pageWrapRefs[num]
+    const cv = canvasRefs[num]
+    if (wrap && scrollArea.value && cv) {
+      await nextTick()
+      await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))
+      scrollWrapIntoScrollArea(wrap, 'smooth')
+      emit('page-change', num)
+      return
+    }
+    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))
   }
   emit('page-change', num)
 }
@@ -241,7 +288,12 @@ defineExpose({
 // ── 监听 props 变化 ───────────────────────────
 watch(() => props.pdfUrl,     url  => loadPdf(url))
 watch(() => props.highlights, ()   => nextTick(applyAllHighlights), { deep: true })
-watch(() => props.targetPage, page => { if (page && page > 0) jumpToPage(page) })
+watch(
+  () => props.targetPage,
+  page => {
+    if (page && page > 0) void jumpToPage(page)
+  },
+)
 
 onMounted(() => { if (props.pdfUrl) loadPdf(props.pdfUrl) })
 onBeforeUnmount(() => { if (observer) observer.disconnect() })

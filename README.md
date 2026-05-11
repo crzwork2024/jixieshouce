@@ -8,7 +8,7 @@
 |------|------|
 | 后端 | Python 3.11+ · FastAPI · ChromaDB |
 | 嵌入 | BAAI/bge-large-zh-v1.5（硅基流动 API） |
-| LLM  | DeepSeek-R1-0528-Qwen3-8B（硅基流动 API） |
+| LLM  | deepseek-ai/DeepSeek-V3.2 / deepseek-ai/DeepSeek-R1-0528-Qwen3-8B（硅基流动 API） |
 | 前端 | Vue 3 · Element Plus · PDF.js |
 
 ---

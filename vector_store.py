@@ -396,14 +396,7 @@ class VectorStore:
             where=where,
         )
         child_hits = self._parse_results(results)
-
-        if chapter_paths:
-            filtered = [
-                c for c in child_hits
-                if _chapter_path_matches_toc_filter(c.get("chapter_path", ""), chapter_paths)
-            ]
-            if filtered:
-                child_hits = filtered
+        child_hits = _apply_toc_filter_smart(child_hits, chapter_paths)
 
         # 按 parent_block_id 去重，保留最高分
         seen_parents: dict[str, dict] = {}
@@ -467,13 +460,7 @@ class VectorStore:
             where=where,
         )
         candidates = self._parse_results(results)
-        if chapter_paths:
-            filtered = [
-                c for c in candidates
-                if _chapter_path_matches_toc_filter(c.get("chapter_path", ""), chapter_paths)
-            ]
-            if filtered:
-                candidates = filtered
+        candidates = _apply_toc_filter_smart(candidates, chapter_paths)
         ranked = _rerank_by_keyword(query, candidates)
         return ranked[:top_k]
 
@@ -639,11 +626,33 @@ def _chapter_path_matches_toc_filter(block_path: str, toc_hints: list[str]) -> b
             continue
         if bp == h:
             return True
+        if h in bp:
+            return True
         if h in segments:
             return True
         if bp.startswith(h + " >") or bp.startswith(h + ">"):
             return True
     return False
+
+
+def _apply_toc_filter_smart(
+    child_hits: list[dict],
+    chapter_paths: list[str] | None,
+) -> list[dict]:
+    """按 TOC 命中过滤；若过滤后最高分明显低于未过滤头部，回退为不过滤（减轻误杀）。"""
+    if not chapter_paths or not child_hits:
+        return child_hits
+    filtered = [
+        c for c in child_hits
+        if _chapter_path_matches_toc_filter(c.get("chapter_path", ""), chapter_paths)
+    ]
+    if not filtered:
+        return child_hits
+    top_u = max(c["score"] for c in child_hits)
+    top_f = max(c["score"] for c in filtered)
+    if top_f + 0.06 < top_u:
+        return child_hits
+    return filtered
 
 
 # ─────────────────────────────────────────────
@@ -683,6 +692,25 @@ def _auto_find_processed(data_dir: str) -> list[dict]:
     return entries
 
 
+def _reset_chroma_collections(persist_dir: str) -> None:
+    """删除持久化目录中的全部业务 collection，用于全量重建索引。"""
+    client = chromadb.PersistentClient(
+        path=persist_dir,
+        settings=Settings(anonymized_telemetry=False),
+    )
+    for name in (
+        TOC_COLLECTION_NAME,
+        BLOCKS_COLLECTION_NAME,
+        CHILD_CHUNKS_COLLECTION_NAME,
+        PARENT_BLOCKS_COLLECTION_NAME,
+    ):
+        try:
+            client.delete_collection(name)
+            print(f"  已删除 collection: {name}")
+        except Exception as e:
+            print(f"  删除 {name} 时跳过或失败: {e}")
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -693,7 +721,16 @@ if __name__ == "__main__":
     parser.add_argument("--child",    default=None, help="子块 JSON 文件路径")
     parser.add_argument("--data_dir", default="./data",     help="数据目录（自动扫描 processed/），默认 ./data")
     parser.add_argument("--db_dir",   default="./chroma_db", help="ChromaDB 持久化目录")
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="重建前清空向量库中的全部 collection（无需手动删文件夹；若仍报错请先关闭占用库的 API 服务）",
+    )
     args = parser.parse_args()
+
+    if args.reset:
+        print(f"重置向量库（清空 collections）: {args.db_dir}")
+        _reset_chroma_collections(args.db_dir)
 
     vs = VectorStore(persist_dir=args.db_dir)
 

@@ -51,6 +51,17 @@ def normalize_bbox(bbox: list[float], page_size: list[float]) -> list[float]:
     return [round(x1 / w, 4), round(y1 / h, 4), round(x2 / w, 4), round(y2 / h, 4)]
 
 
+def normalize_embed_text(s: str) -> str:
+    """
+    轻量清洗嵌入用文本：MinerU/OCR 常见「??」占位，替换为间隔符以利向量匹配。
+    不修改 raw_content，仅用于 search_text / 目录检索文本。
+    """
+    if not s:
+        return s
+    t = re.sub(r"\?{2,}", "·", s.strip())
+    return t
+
+
 def merge_html_tables(html_parts: list[str]) -> str:
     """
     将多段 <table>…</table> 合并为一张表（去掉中间段的 <table><tr><td>表头</td></tr> 并拼接 tbody）。
@@ -116,6 +127,12 @@ class MinerUProcessor:
         re.UNICODE,
     )
 
+    # 独立小节标题：以「数字.数字」开头（MinerU 常与章同级标为 level 1，需抬到 2 级及以下）
+    _OUTLINE_NUMBERED_SECTION_RE = re.compile(
+        r"^\d+(?:\.\d+)+[\s\.、．]",
+        re.UNICODE,
+    )
+
     def __init__(self, pdf_id: str, input_dir: str):
         self.pdf_id    = pdf_id
         self.input_dir = Path(input_dir)
@@ -128,6 +145,26 @@ class MinerUProcessor:
         self._parent_blocks:   list[dict] = []   # 聚合后父块列表
         self._child_blocks:    list[dict] = []   # 携带 parent_block_id 的子块列表
         self._chapter_stack: list[str]    = []   # 当前章节路径栈
+
+    def _effective_title_level(self, title: str, mineru_level: int) -> int:
+        """
+        结合标题文案推断大纲层级，避免 MinerU 将「第 2 章」与「1.2 小节」均标为 level=1
+        时冲掉 chapter_stack 父级。
+        """
+        t = title.strip().lstrip("#").strip()
+        if re.match(r"^第\s*[一二三四五六七八九十百千零〇两\d]+\s*章", t):
+            return 1
+        m = re.match(r"^(\d+(?:\.\d+)+)", t)
+        if m:
+            return min(len(m.group(1).split(".")), 6)
+        if re.match(r"^\d+[\s\u3000]+\S", t):
+            return 2
+        # OCR 乱码节号：如「1?? 2 xxx」「1 2 xxx」
+        if re.match(r"^\d+\?*\s*\d+\s", t) or re.match(r"^\d+\s+\d+\s+\S", t):
+            return 2 if self._chapter_stack else 1
+        if self._OUTLINE_NUMBERED_SECTION_RE.match(t):
+            return 2
+        return max(1, int(mineru_level) if mineru_level else 1)
 
     # ────────────────────────────────────────
     # 公开接口
@@ -286,10 +323,11 @@ class MinerUProcessor:
     def _extract_toc(self):
         """
         从所有 title 类型块中提取章节层级，生成目录树。
-        层级由 block 的 level 字段决定（默认为 1）。
+        层级优先由标题文案推断，其次使用 MinerU 的 level。
         """
         toc_entries: list[dict] = []
         seen_ids: set[str] = set()
+        self._chapter_stack = []
 
         for page in self._raw_pages:
             for block in page:
@@ -302,8 +340,10 @@ class MinerUProcessor:
                     continue
                 seen_ids.add(bid)
 
-                level  = block.get("level", 1)
+                raw_lv = block.get("level", 1)
                 text   = block.get("text", "").strip().lstrip("#").strip()
+                level  = self._effective_title_level(text, raw_lv)
+                self._get_chapter_path(level, text)
                 pidx   = block.get("page_idx", 0)
                 bbox   = block.get("bbox", [0, 0, 0, 0])
                 psize  = block.get("page_size", [1, 1])
@@ -316,7 +356,7 @@ class MinerUProcessor:
                     "page_idx":  pidx,
                     "bbox":      normalize_bbox(bbox, psize),
                     "pdf_file_id": self.pdf_id,
-                    "search_text": text,
+                    "search_text": normalize_embed_text(text),
                 })
 
         self._toc = toc_entries
@@ -350,8 +390,10 @@ class MinerUProcessor:
 
                 # 更新章节路径
                 if btype in self.TITLE_TYPES:
-                    level = block.get("level", 1)
                     title = block.get("text", "").strip().lstrip("#").strip()
+                    level = self._effective_title_level(
+                        title, block.get("level", 1)
+                    )
                     self._get_chapter_path(level, title)
 
                 # 如果是合并子块，输出合并父块（仅一次）
@@ -379,7 +421,7 @@ class MinerUProcessor:
         if btype in self.TITLE_TYPES:
             text = block.get("text", "").strip().lstrip("#").strip()
             raw_content = text
-            search_text = text
+            search_text = normalize_embed_text(text)
         elif btype in self.TABLE_TYPES:
             html = block.get("table_body", "") or block.get("text", "")
             raw_content = html
@@ -406,7 +448,9 @@ class MinerUProcessor:
             "pdf_file_id":   self.pdf_id,
         }
         if btype in self.TITLE_TYPES:
-            sem["title_level"] = block.get("level", 1)
+            sem["title_level"] = self._effective_title_level(
+                text, block.get("level", 1)
+            )
         return sem
 
     def _make_semantic_block_from_merged(self, merged: dict) -> dict:

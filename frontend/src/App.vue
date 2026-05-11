@@ -197,7 +197,7 @@ async function fetchToc(pdfFileId) {
 function onTocSelect(item) {
   activeTocId.value = item.toc_id
   const page = (item.page_idx || 0) + 1
-  jumpToPage.value = page
+  _triggerJump(page)
 
   // 高亮目录对应 bbox
   if (item.bbox && item.bbox.length === 4) {

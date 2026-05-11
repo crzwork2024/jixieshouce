@@ -225,14 +225,16 @@ class RAGEngine:
         chapter_paths = list({r["chapter_path"] for r in toc_results if r["chapter_path"]})
 
         # 第二阶段：语义块检索
-        # 如果有多模态意图，先检索对应类型块，再补充普通文本块
-        blocks: list[dict] = []
+        # 含「表/图」等多模态词时：单独放大 table/image 通道的 top_k，避免大块 section 挤掉目标表
+        modal_k = max(top_k_blocks, 8) if modal_filter else top_k_blocks
+        text_k = top_k_blocks + 2 if modal_filter else top_k_blocks
 
+        blocks: list[dict] = []
         if modal_filter:
             modal_blocks = self.vs.query_blocks(
                 query=query,
                 chapter_paths=chapter_paths or None,
-                top_k=top_k_blocks,
+                top_k=modal_k,
                 block_type_filter=modal_filter,
                 pdf_file_id=pdf_file_id,
             )
@@ -241,14 +243,23 @@ class RAGEngine:
         text_blocks = self.vs.query_blocks(
             query=query,
             chapter_paths=chapter_paths or None,
-            top_k=top_k_blocks,
+            top_k=text_k,
             block_type_filter=None,
             pdf_file_id=pdf_file_id,
         )
         blocks.extend(text_blocks)
 
-        # 去重 & 排序
-        blocks = _dedup_and_sort_blocks(blocks)[:top_k_blocks]
+        blocks = _dedup_and_sort_blocks(blocks)
+        if modal_filter == "table":
+            tbl_types = ("table", "table_unit")
+            tbl = [b for b in blocks if b.get("block_type") in tbl_types]
+            rest = [b for b in blocks if b.get("block_type") not in tbl_types]
+            blocks = tbl[:4] + rest
+        elif modal_filter == "image":
+            img = [b for b in blocks if b.get("block_type") == "image"]
+            rest = [b for b in blocks if b.get("block_type") != "image"]
+            blocks = img[:4] + rest
+        blocks = blocks[:top_k_blocks]
 
         return {
             "query":         query,
